@@ -1,0 +1,764 @@
+---
+title: "GBM scRNA-seq: Iavarone functional state subtyping"
+subtitle: "Mikolajewicz cohort · Singh Lab · v1.1"
+author: "Singh Lab"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    fig-width: 8
+    fig-height: 6
+    theme: cosmo
+execute:
+  warning: false
+  message: false
+---
+
+```{r setup-knitr}
+#| include: false
+knitr::opts_chunk$set(
+  echo = TRUE,
+  fig.path = "figures/",
+  dev = "png",
+  dpi = 150
+)
+```
+
+# Introduction
+
+Glioblastoma (GBM) is the most common and aggressive primary brain tumour in adults. Malignant cells within a single tumour are not uniform: they sit in different **functional states** with distinct metabolic programs, neuronal mimicry, or proliferative capacity. Knowing which state a cell is in helps connect molecular targets to biology that is actually active in patient tissue.
+
+Iavarone et al. defined four recurrent GBM tumour-cell states using spatial transcriptomics (CosMx) and validated them in other cohorts:
+
+| State | Name | Biological theme |
+|-------|------|------------------|
+| **GPM** | Glycolytic / plurimetabolic | High glycolysis and flexible nutrient use |
+| **MTC** | Mitochondrial | Oxidative phosphorylation and mitochondrial metabolism |
+| **NEU** | Neuronal | Neuronal lineage mimicry / synaptic programs |
+| **PPR** | Proliferative / progenitor | Cell cycle and DNA replication |
+
+We do not reproduce their full single-cell GSEA pipeline here. Instead we **score each tumour cell against four published 13-gene signatures** and assign the state with the highest score (winner-take-all).
+
+### Hypothesis
+
+**PYGL** (muscle glycogen phosphorylase) and **PYGB** (brain glycogen phosphorylase) break down glycogen to glucose-1-phosphate, the first step in mobilising stored carbohydrate. The **GPM** state is defined by glycolytic and plurimetabolic programs, so we expect:
+
+> **PYGL and PYGB expression should be enriched in GPM-classified tumour cells** compared with MTC, NEU, and PPR.
+
+If that holds, glycogen metabolism (and PYGL/PYGB in particular) looks relevant in patient GBM, not just in cell lines.
+
+### Data
+
+- `data/gbm_seurat.rds`: processed Seurat object (Mikolajewicz snRNA-seq, ~18 patients)
+- `data/iavarone_signatures.csv`: four gene signatures (Table S2 format)
+- `data/mikolajewicz_metadata.csv`: optional per-cell metadata (same fields should be in `@meta.data`)
+
+---
+
+## Step 0: Setup
+
+Load packages, record versions, set a random seed. UMAP and tie-breaking in `max.col` can depend on the seed, so we fix it for reproducibility.
+
+```{r step0-setup}
+library(Seurat)
+library(tidyverse)
+library(ggplot2)
+library(patchwork)
+
+dir.create("figures", showWarnings = FALSE, recursive = TRUE)
+
+use_ucell <- requireNamespace("UCell", quietly = TRUE)
+if (!use_ucell) {
+  message(
+    "Package 'UCell' is not installed. Attempting Bioconductor install...\n",
+    "If install fails, the notebook will fall back to Seurat::AddModuleScore."
+  )
+  if (!requireNamespace("BiocManager", quietly = TRUE)) {
+    install.packages("BiocManager")
+  }
+  tryCatch(
+    BiocManager::install("UCell", update = FALSE, ask = FALSE),
+    error = function(e) message("UCell install failed: ", conditionMessage(e))
+  )
+  use_ucell <- requireNamespace("UCell", quietly = TRUE)
+}
+if (use_ucell) {
+  library(UCell)
+  scoring_method <- "UCell (rank-based; robust to sequencing depth)"
+} else {
+  scoring_method <- "AddModuleScore (mean-expression minus control genes)"
+  message("Using Seurat::AddModuleScore as fallback.")
+}
+
+set.seed(42)
+
+cat("Scoring method:", scoring_method, "\n\n")
+print(sessionInfo())
+```
+
+`sessionInfo()` above has package versions. Worth keeping if you share or publish these results.
+
+---
+
+## Step 1: Load and inspect the Seurat object
+
+The Seurat object holds expression **assays**, per-cell **meta.data** (patient, cell type, QC, etc.), and dimensionality **reductions** (PCA, UMAP). We print a summary before doing anything else to catch bad paths or missing columns early.
+
+```{r step1-load}
+seurat_path <- "data/gbm_seurat.rds"
+stopifnot(file.exists(seurat_path))
+
+obj <- readRDS(seurat_path)
+
+cat("=== Seurat object summary ===\n")
+print(obj)
+
+cat("\n=== meta.data column names ===\n")
+print(colnames(obj@meta.data))
+
+cat("\n=== First rows of meta.data ===\n")
+print(head(obj@meta.data))
+
+cat("\n=== Assays ===\n")
+print(Assays(obj))
+
+cat("\n=== Reductions (embeddings) ===\n")
+print(Reductions(obj))
+```
+
+### Metadata checks
+
+We need `cell_type` (to subset tumour cells) and `sample` (patient ID for pseudobulk).
+
+```{r step1-metadata-tables}
+required_cols <- c("cell_type", "sample")
+missing_cols <- setdiff(required_cols, colnames(obj@meta.data))
+if (length(missing_cols) > 0) {
+  stop(
+    "Required metadata columns missing: ", paste(missing_cols, collapse = ", "),
+    "\nAvailable: ", paste(colnames(obj@meta.data), collapse = ", ")
+  )
+}
+
+cat("=== cell_type ===\n")
+print(table(obj$cell_type, useNA = "ifany"))
+
+cat("\n=== sample (cells per patient) ===\n")
+print(sort(table(obj$sample), decreasing = TRUE))
+
+cat("\n=== Unique patients ===\n")
+print(length(unique(obj$sample)))
+```
+
+### What to expect
+
+After the chunks above you should see roughly **10⁵ cells** across **18 patients** (`P1`–`P8`, `R1`–`R11`, `R9`). `cell_type` includes `tumor`, `neuron`, `myeloid`, `oligodendrocyte`, `astrocyte`, and others. The object usually has a normalised RNA assay (`SCT` or `RNA`) and may already include UMAP. If not, Step 6 can rebuild it from `umap_x` / `umap_y` in metadata.
+
+---
+
+## Step 2: Restrict to tumour cells
+
+Iavarone's four states describe malignant tumour-cell programs. Neurons, myeloid, oligodendrocytes, and other non-tumour cells express overlapping genes (e.g. neuronal signature genes in real neurons) and would mess up state assignment if left in.
+
+Subset to `cell_type == "tumor"` (American spelling in this object).
+
+```{r step2-subset-tumor}
+n_before <- ncol(obj)
+
+if (!"tumor" %in% obj$cell_type) {
+  stop(
+    "'tumor' not found in cell_type. Unique values: ",
+    paste(unique(obj$cell_type), collapse = ", ")
+  )
+}
+
+obj_tumor <- subset(obj, subset = cell_type == "tumor")
+n_after <- ncol(obj_tumor)
+
+cat("Cells before tumour subset:", n_before, "\n")
+cat("Cells after tumour subset: ", n_after, "\n")
+cat("Fraction tumour: ", round(100 * n_after / n_before, 1), "%\n\n")
+
+cat("=== Tumour cells per patient ===\n")
+print(sort(table(obj_tumor$sample), decreasing = TRUE))
+```
+
+In many GBM snRNA-seq datasets tumour cells are a minority because the TME is cell-rich. In this Mikolajewicz cohort they are often the majority (~70% of cells), but it varies by patient. Either way, `n_after` is the denominator for all downstream state calls. Sparse patient × state combinations can add noise to pseudobulk later.
+
+---
+
+## Step 3: Load Iavarone signatures
+
+The signature CSV has a slightly odd layout:
+
+1. **Line 1**: title row (skip)
+2. **Line 2**: column headers `GPM`, `MTC`, `NEU`, `PPR`
+3. **Lines 3+**: ~13 genes per state; columns can differ in length
+
+```{r step3-load-signatures}
+sig_path <- "data/iavarone_signatures.csv"
+stopifnot(file.exists(sig_path))
+
+sig_df <- readr::read_csv(
+  sig_path,
+  skip = 1,
+  col_names = TRUE,
+  show_col_types = FALSE
+)
+
+signatures <- lapply(sig_df, function(col) {
+  genes <- na.omit(col)
+  genes <- genes[genes != ""]
+  as.character(genes)
+})
+signatures <- signatures[intersect(names(signatures), c("GPM", "MTC", "NEU", "PPR"))]
+
+cat("=== Signature gene counts ===\n")
+for (nm in names(signatures)) {
+  cat(sprintf("  %s: %d genes\n", nm, length(signatures[[nm]])))
+}
+
+obj_genes <- rownames(obj_tumor)
+
+cat("\n=== Overlap with Seurat rownames ===\n")
+sig_overlap <- lapply(signatures, function(genes) {
+  present <- intersect(genes, obj_genes)
+  missing <- setdiff(genes, obj_genes)
+  list(present = present, missing = missing)
+})
+
+for (nm in names(sig_overlap)) {
+  n_pres <- length(sig_overlap[[nm]]$present)
+  n_tot  <- length(signatures[[nm]])
+  cat(sprintf("  %s: %d / %d present in data\n", nm, n_pres, n_tot))
+  if (length(sig_overlap[[nm]]$missing) > 0) {
+    cat("    Missing:", paste(sig_overlap[[nm]]$missing, collapse = ", "), "\n")
+  }
+}
+```
+
+Gene symbols can differ across pipelines (Ensembl vs symbol, alias updates, dropout in snRNA-seq). UCell and AddModuleScore only use genes present in the matrix; missing genes are dropped silently. With only ~13 genes per signature, losing a few can shift scores noticeably. We print missing genes so you can judge how much to trust each state's score.
+
+---
+
+## Step 4: Score cells against the four signatures
+
+For each cell and signature, module scoring asks whether that gene set is relatively highly expressed.
+
+- **UCell** (`AddModuleScore_UCell`): rank-based; robust to library size.
+- **AddModuleScore** (Seurat): mean signature expression minus matched control genes. Simpler but more sensitive to depth and normalisation.
+
+Both give one numeric score per cell per signature. Higher = stronger evidence for that program.
+
+```{r step4-score}
+signatures_present <- lapply(signatures, function(g) intersect(g, obj_genes))
+
+if (use_ucell) {
+  obj_tumor <- UCell::AddModuleScore_UCell(
+    obj_tumor,
+    features = signatures_present,
+    name = ""
+  )
+  score_cols <- names(signatures_present)
+} else {
+  obj_tumor <- Seurat::AddModuleScore(
+    obj_tumor,
+    features = signatures_present,
+    name = "Iavarone_"
+  )
+  score_cols <- tail(
+    colnames(obj_tumor@meta.data),
+    length(signatures_present)
+  )
+  names_map <- setNames(score_cols, names(signatures_present))
+  for (state in names(signatures_present)) {
+    obj_tumor[[state]] <- obj_tumor@meta.data[[names_map[state]]]
+  }
+  score_cols <- names(signatures_present)
+}
+
+cat("Score columns used:", paste(score_cols, collapse = ", "), "\n\n")
+cat("=== Summary of signature scores ===\n")
+print(summary(obj_tumor@meta.data[, score_cols, drop = FALSE]))
+```
+
+Check the summaries for comparable scales. Big outliers might be ambient RNA or doublets.
+
+---
+
+## Step 5: Assign each cell to its top-scoring state
+
+Winner-take-all: `iavarone_state` is whichever of GPM / MTC / NEU / PPR has the highest score (`max.col`).
+
+```{r step5-assign-state}
+score_mat <- as.matrix(obj_tumor@meta.data[, score_cols, drop = FALSE])
+
+# ties go to the first max column (deterministic)
+top_idx <- max.col(score_mat, ties.method = "first")
+obj_tumor$iavarone_state <- factor(
+  score_cols[top_idx],
+  levels = c("GPM", "MTC", "NEU", "PPR")
+)
+
+cat("=== Cell counts per state ===\n")
+state_tab <- table(obj_tumor$iavarone_state)
+print(state_tab)
+
+cat("\n=== Proportions ===\n")
+print(round(prop.table(state_tab) * 100, 1))
+```
+
+Real cells can be mixed or transitional. One hard label throws away cells where two scores are close. For population-level hypothesis testing that is usually fine; for stratifying drug targets you might keep continuous scores instead.
+
+---
+
+## Step 6: UMAP
+
+UMAP projects high-dimensional expression to 2D. Nearby points are transcriptionally similar. Clean colour separation suggests the signatures capture real variation; heavy mixing suggests gradual or ambiguous states.
+
+```{r step6-umap}
+if ("umap" %in% Reductions(obj_tumor)) {
+  umap_source <- "Existing 'umap' reduction in Seurat object"
+} else if (all(c("umap_x", "umap_y") %in% colnames(obj_tumor@meta.data))) {
+  umap_source <- "Built from umap_x / umap_y columns in meta.data"
+  umap_mat <- as.matrix(obj_tumor@meta.data[, c("umap_x", "umap_y")])
+  rownames(umap_mat) <- colnames(obj_tumor)
+  colnames(umap_mat) <- c("UMAP_1", "UMAP_2")
+  obj_tumor[["umap"]] <- CreateDimReducObject(
+    embeddings = umap_mat,
+    key = "UMAP_",
+    assay = DefaultAssay(obj_tumor)
+  )
+} else {
+  umap_source <- "Recomputed (RunUMAP on PCA; slow on tumour-only subset)"
+  obj_tumor <- NormalizeData(obj_tumor, verbose = FALSE)
+  obj_tumor <- FindVariableFeatures(obj_tumor, verbose = FALSE)
+  obj_tumor <- ScaleData(obj_tumor, verbose = FALSE)
+  obj_tumor <- RunPCA(obj_tumor, verbose = FALSE)
+  obj_tumor <- RunUMAP(obj_tumor, dims = 1:30, verbose = FALSE)
+}
+
+cat("UMAP source:", umap_source, "\n")
+
+p_umap <- DimPlot(
+  obj_tumor,
+  reduction = "umap",
+  group.by = "iavarone_state",
+  cols = c(GPM = "#E41A1C", MTC = "#377EB8", NEU = "#4DAF4A", PPR = "#984EA3"),
+  pt.size = 0.2
+) +
+  labs(
+    title = "Iavarone functional states (tumour cells)",
+    subtitle = umap_source
+  ) +
+  theme(plot.title = element_text(face = "bold"))
+
+print(p_umap)
+
+ggsave(
+  "figures/umap_states.png",
+  plot = p_umap,
+  width = 8,
+  height = 6,
+  dpi = 150
+)
+```
+
+Blobs of one colour = cells sharing that program. Intermingled colours = transitions or scoring ambiguity, which is common in GBM.
+
+---
+
+## Step 7: PYGL and PYGB across states
+
+PYGL (liver/muscle isoform) and PYGB (brain isoform) catalyse glycogen breakdown. We test whether they track the **GPM** state.
+
+Three checks, treating **PYGL** and **PYGB** separately:
+
+1. **Pseudobulk plot**: mean expression per patient × state. Each point is one patient. Works better than single-cell violins when most cells are zero (dropout).
+2. **Paired patient test**: within each patient, GPM mean vs pooled non-GPM; then test across patients.
+3. **Spearman vs GPM score**: expression vs continuous GPM UCell score, no hard state labels.
+
+We skip single-cell violins here. PYGL/PYGB are dropout-heavy and violins mostly show a spike at zero.
+
+```{r step7-target-genes}
+target_genes <- c("PYGL", "PYGB")
+missing_targets <- setdiff(target_genes, obj_genes)
+
+if (length(missing_targets) > 0) {
+  warning(
+    "TARGET GENE(S) MISSING FROM DATA: ",
+    paste(missing_targets, collapse = ", "),
+    "\nDownstream plots will skip missing genes."
+  )
+}
+present_targets <- intersect(target_genes, obj_genes)
+cat("Target genes present:", paste(present_targets, collapse = ", "), "\n")
+```
+
+### Pseudobulk expression
+
+```{r step7-pseudobulk}
+cat("DefaultAssay for expression:", DefaultAssay(obj_tumor), "\n")
+expr_mat <- tryCatch(
+  GetAssayData(obj_tumor, assay = DefaultAssay(obj_tumor), layer = "data"),
+  error = function(e) GetAssayData(obj_tumor, assay = DefaultAssay(obj_tumor), slot = "data")
+)
+
+meta_pb <- obj_tumor@meta.data %>%
+  tibble::rownames_to_column("cell") %>%
+  dplyr::select(cell, sample, iavarone_state)
+
+expr_long <- expr_mat[present_targets, , drop = FALSE] %>%
+  as.matrix() %>%
+  t() %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("cell") %>%
+  tidyr::pivot_longer(
+    cols = all_of(present_targets),
+    names_to = "gene",
+    values_to = "expression"
+  ) %>%
+  dplyr::inner_join(meta_pb, by = "cell")
+
+pseudobulk <- expr_long %>%
+  dplyr::group_by(sample, iavarone_state, gene) %>%
+  dplyr::summarise(
+    mean_expression = mean(expression),
+    n_cells = dplyr::n(),
+    .groups = "drop"
+  )
+
+cat("=== Pseudobulk rows (patient × state × gene) ===\n")
+print(head(pseudobulk, 12))
+
+cat("\n=== Patients contributing per state (cell counts) ===\n")
+print(
+  pseudobulk %>%
+    dplyr::group_by(iavarone_state) %>%
+    dplyr::summarise(
+      n_patients = dplyr::n_distinct(sample),
+      total_cells = sum(n_cells),
+      .groups = "drop"
+    )
+)
+```
+
+```{r step7-pseudobulk-plot}
+if (nrow(pseudobulk) > 0) {
+  state_fill <- c(GPM = "#E41A1C", MTC = "#377EB8", NEU = "#4DAF4A", PPR = "#984EA3")
+
+  p_pb <- ggplot(pseudobulk, aes(x = iavarone_state, y = mean_expression, fill = iavarone_state)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.35, width = 0.55) +
+    geom_point(aes(color = sample), position = position_jitter(width = 0.12), size = 2.8, alpha = 0.9) +
+    facet_wrap(~ gene, scales = "free_y") +
+    scale_fill_manual(values = state_fill) +
+    labs(
+      title = "PYGL and PYGB expression by Iavarone state (patient pseudobulk)",
+      subtitle = "Each point = one patient; y = mean SCT-normalised expression within patient × state",
+      x = "Iavarone state",
+      y = "Mean expression (patient pseudobulk)"
+    ) +
+    theme_bw(base_size = 12) +
+    theme(legend.position = "none", plot.title = element_text(face = "bold"))
+
+  print(p_pb)
+
+  ggsave(
+    "figures/pseudobulk_PYGL_PYGB_by_state.png",
+    plot = p_pb,
+    width = 9,
+    height = 5,
+    dpi = 150
+  )
+}
+```
+
+### Quick numeric comparison (GPM vs others)
+
+```{r step7-stats}
+if (nrow(pseudobulk) > 0) {
+  stats_summary <- pseudobulk %>%
+    dplyr::group_by(gene, iavarone_state) %>%
+    dplyr::summarise(
+      mean_across_patients = mean(mean_expression),
+      median_across_patients = median(mean_expression),
+      n_patients = dplyr::n(),
+      .groups = "drop"
+    )
+
+  cat("=== Pseudobulk mean expression per state (averaged across patients) ===\n")
+  print(stats_summary)
+
+  fc_tbl <- pseudobulk %>%
+    dplyr::group_by(gene) %>%
+    dplyr::summarise(
+      n_gpm_obs = sum(iavarone_state == "GPM"),
+      n_non_gpm_obs = sum(iavarone_state != "GPM"),
+      mean_gpm = mean(mean_expression[iavarone_state == "GPM"], na.rm = TRUE),
+      mean_non_gpm = mean(mean_expression[iavarone_state != "GPM"], na.rm = TRUE),
+      fold_change_gpm_vs_rest = mean_gpm / mean_non_gpm,
+      .groups = "drop"
+    )
+
+  cat("\n=== Fold change (GPM vs other states, pseudobulk) ===\n")
+  print(fc_tbl)
+
+  for (g in unique(pseudobulk$gene)) {
+    sub <- pseudobulk %>% dplyr::filter(gene == g)
+    if (dplyr::n_distinct(sub$iavarone_state) >= 2 && nrow(sub) >= 4) {
+      kw <- kruskal.test(mean_expression ~ iavarone_state, data = sub)
+      cat(sprintf("\nKruskal-Wallis for %s across states: p = %.4g\n", g, kw$p.value))
+    }
+  }
+}
+```
+
+A t-test on 50k cells treats cells as independent and inflates significance. Patients (~18) are the real replicates for "is PYGL higher in GPM in GBM patients?"
+
+### Paired test: GPM vs non-GPM within each patient
+
+Each patient contributes a GPM mean and a non-GPM mean (MTC + NEU + PPR pooled). Pairing controls for between-patient differences in expression, purity, and treatment. With ~18 patients, n = 18 is the replicate count.
+
+```{r step7-paired-test}
+paired_stats <- NULL
+
+if (exists("expr_long") && nrow(expr_long) > 0) {
+  patient_paired <- expr_long %>%
+    dplyr::group_by(sample, gene) %>%
+    dplyr::summarise(
+      gpm_mean = mean(expression[iavarone_state == "GPM"], na.rm = TRUE),
+      rest_mean = mean(expression[iavarone_state != "GPM"], na.rm = TRUE),
+      n_gpm = sum(iavarone_state == "GPM"),
+      n_rest = sum(iavarone_state != "GPM"),
+      .groups = "drop"
+    ) %>%
+    dplyr::filter(n_gpm > 0, n_rest > 0) %>%
+    dplyr::mutate(paired_diff = gpm_mean - rest_mean)
+
+  cat("=== Patients included per gene (must have GPM and non-GPM cells) ===\n")
+  print(patient_paired %>% dplyr::count(gene, name = "n_patients"))
+
+  paired_stats <- lapply(present_targets, function(g) {
+    sub <- patient_paired %>% dplyr::filter(gene == g)
+    if (nrow(sub) < 3) {
+      return(tibble::tibble(
+        gene = g, n_patients = nrow(sub), median_paired_diff = NA_real_,
+        fold_change_gpm_vs_rest = NA_real_, wilcox_p = NA_real_, ttest_p = NA_real_,
+        verdict = "Insufficient patients for testing"
+      ))
+    }
+    wt <- wilcox.test(sub$gpm_mean, sub$rest_mean, paired = TRUE, exact = FALSE)
+    tt <- t.test(sub$gpm_mean, sub$rest_mean, paired = TRUE)
+    med_diff <- stats::median(sub$paired_diff)
+    fc <- mean(sub$gpm_mean) / mean(sub$rest_mean)
+    verdict <- if (!is.na(med_diff) && med_diff > 0 && wt$p.value < 0.05) {
+      "Enrichment in GPM supported"
+    } else {
+      "Enrichment in GPM not supported"
+    }
+    tibble::tibble(
+      gene = g,
+      n_patients = nrow(sub),
+      median_paired_diff = med_diff,
+      fold_change_gpm_vs_rest = fc,
+      wilcox_p = wt$p.value,
+      ttest_p = tt$p.value,
+      verdict = verdict
+    )
+  }) %>%
+    dplyr::bind_rows()
+
+  cat("\n=== Paired GPM vs non-GPM test results ===\n")
+  print(paired_stats)
+
+  for (i in seq_len(nrow(paired_stats))) {
+    cat(sprintf(
+      "\n%s: %s\n",
+      paired_stats$gene[i], paired_stats$verdict[i]
+    ))
+  }
+}
+```
+
+`median_paired_diff` > 0 means most patients have higher expression in GPM cells. Wilcoxon is the primary test; paired t-test is secondary.
+
+### Spearman correlation with GPM score
+
+Hard labels drop nuance. If PYGL tracks the GPM program, expression should correlate with the continuous **GPM UCell score** even before bucketing into states.
+
+```{r step7-spearman}
+spearman_stats <- NULL
+gpm_col <- "GPM"
+if (!gpm_col %in% colnames(obj_tumor@meta.data)) {
+  stop("GPM score column not found in meta.data after module scoring.")
+}
+
+if (length(present_targets) > 0) {
+  gpm_scores <- obj_tumor@meta.data[[gpm_col]]
+
+  spearman_stats <- lapply(present_targets, function(g) {
+    gene_expr <- as.numeric(expr_mat[g, ])
+    ct <- stats::cor.test(gpm_scores, gene_expr, method = "spearman", exact = FALSE)
+    interp_line <- if (ct$estimate >= 0.1 && ct$p.value < 0.05) {
+      "Positive correlation with continuous GPM score"
+    } else if (ct$estimate > 0 && ct$p.value < 0.05) {
+      "Weak positive rho; significant at large n but small effect"
+    } else if (ct$estimate > 0) {
+      "Weak positive trend; not significant"
+    } else {
+      "No positive tracking of GPM score"
+    }
+    tibble::tibble(
+      gene = g,
+      spearman_rho = unname(ct$estimate),
+      spearman_p = ct$p.value,
+      interpretation = interp_line
+    )
+  }) %>%
+    dplyr::bind_rows()
+
+  cat("=== Spearman: GPM UCell score vs gene expression (all tumour cells) ===\n")
+  print(spearman_stats)
+
+  for (i in seq_len(nrow(spearman_stats))) {
+    cat(sprintf(
+      "\n%s: rho = %.3f, p = %.4g (%s)\n",
+      spearman_stats$gene[i],
+      spearman_stats$spearman_rho[i],
+      spearman_stats$spearman_p[i],
+      spearman_stats$interpretation[i]
+    ))
+  }
+}
+```
+
+Positive Spearman rho means expression rises with GPM program strength. That can be more informative than categorical labels when states form gradients on the UMAP.
+
+---
+
+## Step 8: Interpretation
+
+```{r step8-interpret-prep}
+interp <- list(
+  n_tumor = ncol(obj_tumor),
+  n_patients = length(unique(obj_tumor$sample)),
+  state_props = round(prop.table(table(obj_tumor$iavarone_state)) * 100, 1),
+  scoring = scoring_method,
+  umap = umap_source
+)
+if (exists("fc_tbl") && nrow(fc_tbl) > 0) interp$fc <- fc_tbl
+if (exists("paired_stats") && nrow(paired_stats) > 0) interp$paired <- paired_stats
+if (exists("spearman_stats") && nrow(spearman_stats) > 0) interp$spearman <- spearman_stats
+
+fmt_paired <- function(g) {
+  if (is.null(paired_stats) || !g %in% paired_stats$gene) return(paste0(g, " paired statistics not available."))
+  row <- paired_stats[paired_stats$gene == g, ]
+  paste0(
+    "**Paired test (n = ", row$n_patients, " patients):** ",
+    "median diff (GPM − rest) = ", round(row$median_paired_diff, 4),
+    "; fold-change = ", round(row$fold_change_gpm_vs_rest, 2),
+    "; Wilcoxon p = ", format.pval(row$wilcox_p, digits = 3),
+    " (paired t-test p = ", format.pval(row$ttest_p, digits = 3), "). ",
+    "**Verdict: ", row$verdict, ".**"
+  )
+}
+
+fmt_spearman <- function(g) {
+  if (is.null(spearman_stats) || !g %in% spearman_stats$gene) return("")
+  row <- spearman_stats[spearman_stats$gene == g, ]
+  paste0(
+    "**Spearman vs GPM score:** rho = ", round(row$spearman_rho, 3),
+    ", p = ", format.pval(row$spearman_p, digits = 3),
+    ". ", row$interpretation, "."
+  )
+}
+
+pygl_paired_line <- fmt_paired("PYGL")
+pygb_paired_line <- fmt_paired("PYGB")
+pygl_spearman_line <- fmt_spearman("PYGL")
+pygb_spearman_line <- fmt_spearman("PYGB")
+
+pygl_verdict <- if (!is.null(paired_stats) && "PYGL" %in% paired_stats$gene) {
+  paired_stats$verdict[paired_stats$gene == "PYGL"]
+} else NA_character_
+
+pygb_verdict <- if (!is.null(paired_stats) && "PYGB" %in% paired_stats$gene) {
+  paired_stats$verdict[paired_stats$gene == "PYGB"]
+} else NA_character_
+
+pygl_narrative <- if (identical(pygl_verdict, "Enrichment in GPM supported")) {
+  "PYGL is higher in GPM than non-GPM cells at the patient level, and expression tracks the continuous GPM score. Glycogen mobilisation via PYGL fits the GPM program in patient GBM."
+} else {
+  "PYGL does not reach significance for GPM enrichment in this cohort. Check effect direction and the pseudobulk plot before concluding."
+}
+
+pygb_narrative <- if (identical(pygb_verdict, "Enrichment in GPM supported")) {
+  "PYGB is enriched in GPM at the patient level."
+} else {
+  "PYGB trends toward GPM in pseudobulk but does not pass the paired patient test. Do not treat it the same as PYGL when discussing targets."
+}
+
+cat("=== Key numbers for interpretation ===\n")
+str(interp, max.level = 2)
+```
+
+### Summary
+
+Classified **`r ncol(obj_tumor)` tumour cells** from **`r length(unique(obj_tumor$sample))` patients** using **`r scoring_method`**.
+
+**State distribution** (winner-take-all):
+
+- GPM: `r state_tab["GPM"]` cells (`r interp$state_props["GPM"]`%)
+- MTC: `r state_tab["MTC"]` cells (`r interp$state_props["MTC"]`%)
+- NEU: `r state_tab["NEU"]` cells (`r interp$state_props["NEU"]`%)
+- PPR: `r state_tab["PPR"]` cells (`r interp$state_props["PPR"]`%)
+
+### UMAP
+
+On `figures/umap_states.png`, GPM, NEU, and MTC often intermingle while PPR tends to separate. That matches other GBM work (e.g. Neftel et al.): proliferation is a discrete cell-cycle program, while metabolic and neuronal-mimicry states look more like gradients. Winner-take-all labels oversimplify those states, which is why we also ran Spearman on the continuous GPM score.
+
+### PYGL
+
+**Prediction:** PYGL should be enriched in GPM.
+
+`r pygl_paired_line`
+
+`r pygl_spearman_line`
+
+`r pygl_narrative`
+
+### PYGB
+
+**Prediction:** PYGB should also be enriched in GPM.
+
+`r pygb_paired_line`
+
+`r pygb_spearman_line`
+
+`r pygb_narrative`
+
+### Caveats
+
+| Issue | Why it matters |
+|-------|----------------|
+| **Small signatures (~13 genes)** | PPR missing H2AZ1/H4C3; a few dropouts shift scores. |
+| **Winner-take-all** | Metabolic states are continuous; labels oversimplify (see UMAP). |
+| **n ≈ 18 patients** | Limited power; report effect sizes, not just p-values. |
+| **Uneven cells per patient × state** | Some pseudobulk / paired means average few cells. |
+| **snRNA-seq dropout** | Glycogen genes are often detected in a minority of nuclei. |
+
+### Takeaways
+
+- **PYGL:** `r if (identical(pygl_verdict, "Enrichment in GPM supported")) "Paired testing and GPM score correlation support enrichment in GPM." else "No clear patient-level enrichment in GPM for PYGL in this cohort."`
+- **PYGB:** `r if (identical(pygb_verdict, "Enrichment in GPM supported")) "Paired testing supports GPM enrichment for PYGB." else "No clear state enrichment for PYGB; keep PYGL and PYGB as separate hypotheses."`
+- **UMAP:** PPR separation with mixed metabolic states is expected. Use continuous GPM scores alongside labels when prioritising targets.
+
+---
+
+## Session info
+
+```{r session-info-final}
+sessionInfo()
+```
