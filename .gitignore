@@ -1,1 +1,4 @@
+# Cohort data (large; local only)
+# Mikolajewicz: gbm_seurat.rds, mikolajewicz_metadata.csv, iavarone_signatures.csv
+# Abdelfattah: Processed_matrix.mtx.gz, Processed_*.tsv.gz, Meta_GBM.txt*, Cluster_GBM.txt*
 data/

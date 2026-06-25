@@ -1,0 +1,579 @@
+---
+title: "GBM scRNA-seq: Iavarone Subtyping (External Validation)"
+subtitle: "Abdelfattah cohort, GSE182109 / Broad SCP1985"
+author: "David George"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    fig-width: 8
+    fig-height: 6
+    theme: cosmo
+execute:
+  warning: false
+  message: false
+---
+
+```{r setup-knitr}
+#| include: false
+knitr::opts_chunk$set(
+  echo = TRUE,
+  fig.path = "figures/",
+  dev = "png",
+  dpi = 150
+)
+```
+
+# Introduction
+
+External validation of the Mikolajewicz Iavarone subtyping analysis on the Abdelfattah et al. GBM scRNA-seq cohort ([GSE182109](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE182109), [SCP1985](https://singlecell.broadinstitute.org/single_cell/study/SCP1985)).
+
+Primary question: does PYGL enrichment in GPM tumour cells replicate at the patient level?
+
+PYGB is a separate secondary hypothesis and is not pooled with PYGL.
+
+The cohort mixes primary and recurrent Grade IV GBM (`Type` column). We report that mix as a limitation; it also asks whether any GPM/PYGL signal holds across disease settings.
+
+### Data (`data/`)
+
+| File | Role |
+|------|------|
+| `Processed_matrix.mtx.gz` + genes/barcodes tsV | Expression matrix |
+| `Meta_GBM.txt.gz` | Cell metadata (SCP export) |
+| `Cluster_GBM.txt.gz` | UMAP coordinates (X, Y) |
+| `iavarone_signatures.csv` | GPM / MTC / NEU / PPR signatures |
+
+### Mikolajewicz reference (v1.1)
+
+| Gene | Paired Wilcoxon p | Fold-change (GPM vs rest) | Spearman rho (GPM score) | Verdict |
+|------|-------------------|---------------------------|------------------------|---------|
+| **PYGL** | 0.037 | 1.41 | 0.105 | GPM enrichment supported |
+| **PYGB** | 0.163 | 1.12 | 0.051 | GPM enrichment not supported |
+
+Abdelfattah results are compared to this table in Step 5.
+
+---
+
+## Step 0: Setup
+
+```{r step0-setup}
+library(Seurat)
+library(Matrix)
+library(tidyverse)
+library(ggplot2)
+library(patchwork)
+
+dir.create("figures", showWarnings = FALSE, recursive = TRUE)
+
+use_ucell <- requireNamespace("UCell", quietly = TRUE)
+if (!use_ucell) {
+  if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+  BiocManager::install("UCell", update = FALSE, ask = FALSE)
+  use_ucell <- requireNamespace("UCell", quietly = TRUE)
+}
+if (use_ucell) library(UCell)
+
+tryCatch(utils::memory.limit(size = 24000), error = function(e) NULL)
+if (exists("mem.maxVSize")) mem.maxVSize(24000)
+
+set.seed(42)
+
+# SCP files carry a TYPE annotation row on line 2; drop it after read
+read_scp_table <- function(path) {
+  df <- read.csv(gzfile(path), stringsAsFactors = FALSE, check.names = FALSE)
+  if (nrow(df) > 0 && identical(df$NAME[1], "TYPE")) {
+    df <- df[-1, , drop = FALSE]
+  }
+  df[!is.na(df$NAME) & df$NAME != "", , drop = FALSE]
+}
+
+cat("UCell available:", use_ucell, "\n\n")
+print(sessionInfo())
+```
+
+---
+
+## Step 1: Load and inspect
+
+SCP exports use two header rows (column names, then `TYPE,group,...`). We read with standard headers and drop the TYPE row. Cell key: `NAME`.
+
+```{r step1-load-mtx}
+data_dir <- "data"
+mtx_path <- file.path(data_dir, "Processed_matrix.mtx.gz")
+genes_path <- file.path(data_dir, "Processed_genes.tsv.gz")
+barcodes_path <- file.path(data_dir, "Processed_barcodes.tsv.gz")
+meta_path <- file.path(data_dir, "Meta_GBM.txt.gz")
+cluster_path <- file.path(data_dir, "Cluster_GBM.txt.gz")
+
+for (p in c(mtx_path, genes_path, barcodes_path, meta_path, cluster_path, "data/iavarone_signatures.csv")) {
+  stopifnot(file.exists(p))
+}
+
+counts <- ReadMtx(
+  mtx = mtx_path,
+  cells = barcodes_path,
+  features = genes_path,
+  feature.column = 1,
+  cell.column = 1
+)
+
+cat("Matrix dimensions:", nrow(counts), "genes x", ncol(counts), "cells\n")
+cat("PYGL in rownames:", "PYGL" %in% rownames(counts), "\n")
+cat("PYGB in rownames:", "PYGB" %in% rownames(counts), "\n")
+
+obj <- CreateSeuratObject(counts = counts, assay = "RNA", project = "Abdelfattah")
+rm(counts); gc()
+
+print(obj)
+```
+
+```{r step1-load-meta}
+meta <- read_scp_table(meta_path)
+rownames(meta) <- meta$NAME
+
+matched <- sum(colnames(obj) %in% meta$NAME)
+cat("Cells matching metadata:", matched, "/", ncol(obj), "\n")
+
+if (matched < ncol(obj)) {
+  obj <- obj[, colnames(obj) %in% meta$NAME]
+}
+
+obj <- AddMetaData(obj, meta[colnames(obj), , drop = FALSE])
+
+print(table(obj$Assignment, useNA = "ifany"))
+print(sort(table(obj$Patient), decreasing = TRUE))
+print(table(obj$Assignment, obj$CopyKatPrediction))
+print(table(obj$Type[obj$Assignment == "Glioma"], useNA = "ifany"))
+print(table(obj$Grade[obj$Assignment == "Glioma"], useNA = "ifany"))
+```
+
+Among `Assignment == "Glioma"` cells, CopyKat calls ~67% aneuploid and ~29% diploid. We do not filter on CopyKat; `Assignment == "Glioma"` is the author malignant label.
+
+```{r step1-load-umap}
+clust <- read_scp_table(cluster_path)
+clust <- clust[!is.na(suppressWarnings(as.numeric(clust$X))), , drop = FALSE]
+clust$X <- as.numeric(clust$X)
+clust$Y <- as.numeric(clust$Y)
+
+umap_idx <- match(colnames(obj), clust$NAME)
+if (any(is.na(umap_idx))) {
+  obj <- obj[, !is.na(umap_idx)]
+  umap_idx <- umap_idx[!is.na(umap_idx)]
+}
+
+umap_mat <- as.matrix(clust[umap_idx, c("X", "Y")])
+rownames(umap_mat) <- colnames(obj)
+colnames(umap_mat) <- c("UMAP_1", "UMAP_2")
+
+obj[["umap"]] <- CreateDimReducObject(
+  embeddings = umap_mat,
+  key = "UMAP_",
+  assay = DefaultAssay(obj)
+)
+```
+
+---
+
+## Step 2: Normalise and subset to Glioma
+
+Log-normalise RNA (`NormalizeData`, `scale.factor = 10000`), then subset to `Assignment == "Glioma"`, matching Mikolajewicz `cell_type == "tumor"`.
+
+```{r step2-prep}
+obj <- NormalizeData(
+  obj,
+  assay = "RNA",
+  normalization.method = "LogNormalize",
+  scale.factor = 10000,
+  verbose = FALSE
+)
+
+n_before <- ncol(obj)
+obj_tumor <- subset(obj, subset = Assignment == "Glioma")
+n_after <- ncol(obj_tumor)
+
+rm(obj); gc()
+
+cat("Glioma cells:", n_after, "of", n_before, "\n")
+cat("Patients:", length(unique(obj_tumor$Patient)), "\n\n")
+print(sort(table(obj_tumor$Patient), decreasing = TRUE))
+print(table(obj_tumor$Type, useNA = "ifany"))
+```
+
+---
+
+## Step 3: Iavarone scoring and states
+
+```{r step3-signatures}
+sig_df <- readr::read_csv("data/iavarone_signatures.csv", skip = 1, show_col_types = FALSE)
+signatures <- lapply(sig_df, function(col) {
+  genes <- na.omit(col)
+  genes <- genes[genes != ""]
+  as.character(genes)
+})
+signatures <- signatures[c("GPM", "MTC", "NEU", "PPR")]
+
+obj_genes <- rownames(obj_tumor)
+signatures_present <- lapply(signatures, function(g) intersect(g, obj_genes))
+for (nm in names(signatures)) {
+  miss <- setdiff(signatures[[nm]], signatures_present[[nm]])
+  cat(sprintf("  %s: %d / %d present", nm, length(signatures_present[[nm]]), length(signatures[[nm]])))
+  if (length(miss) > 0) cat(" | missing:", paste(miss, collapse = ", "))
+  cat("\n")
+}
+```
+
+```{r step3-score}
+stopifnot(use_ucell)
+obj_tumor <- UCell::AddModuleScore_UCell(
+  obj_tumor,
+  features = signatures_present,
+  name = ""
+)
+score_cols <- names(signatures_present)
+
+score_mat <- as.matrix(obj_tumor@meta.data[, score_cols, drop = FALSE])
+obj_tumor$iavarone_state <- factor(
+  score_cols[max.col(score_mat, ties.method = "first")],
+  levels = c("GPM", "MTC", "NEU", "PPR")
+)
+
+state_tab <- table(obj_tumor$iavarone_state)
+print(state_tab)
+print(round(100 * prop.table(state_tab), 1))
+```
+
+NEU is ~61% of Glioma cells here vs ~43% in Mikolajewicz. State fractions are cohort-specific; replication is about PYGL within GPM, not matched state proportions.
+
+```{r step3-umap}
+state_cols <- c(GPM = "#E41A1C", MTC = "#377EB8", NEU = "#4DAF4A", PPR = "#984EA3")
+
+p_umap <- DimPlot(
+  obj_tumor,
+  reduction = "umap",
+  group.by = "iavarone_state",
+  cols = state_cols,
+  pt.size = 0.15
+) +
+  labs(
+    title = "Iavarone states, Abdelfattah Glioma cells",
+    subtitle = "UMAP from Cluster_GBM (not recomputed)"
+  ) +
+  theme(plot.title = element_text(face = "bold"))
+
+print(p_umap)
+ggsave("figures/umap_states_abdelfattah.png", p_umap, width = 8, height = 6, dpi = 150)
+```
+
+---
+
+## Step 4: PYGL and PYGB
+
+Pseudobulk plot (headline), paired patient test (GPM vs pooled non-GPM), cell-level Spearman vs GPM score. PYGL and PYGB analysed separately.
+
+```{r step4-targets}
+target_genes <- c("PYGL", "PYGB")
+present_targets <- intersect(target_genes, rownames(obj_tumor))
+stopifnot(length(present_targets) == 2)
+
+expr_mat <- GetAssayData(obj_tumor, assay = "RNA", layer = "data")
+
+expr_long <- expr_mat[present_targets, , drop = FALSE] %>%
+  as.matrix() %>%
+  t() %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("cell") %>%
+  tidyr::pivot_longer(all_of(present_targets), names_to = "gene", values_to = "expression") %>%
+  dplyr::inner_join(
+    obj_tumor@meta.data %>%
+      tibble::rownames_to_column("cell") %>%
+      dplyr::select(cell, Patient, iavarone_state),
+    by = "cell"
+  )
+
+pseudobulk <- expr_long %>%
+  dplyr::group_by(Patient, iavarone_state, gene) %>%
+  dplyr::summarise(
+    mean_expression = mean(expression),
+    n_cells = dplyr::n(),
+    .groups = "drop"
+  )
+
+print(head(pseudobulk, 8))
+```
+
+```{r step4-pseudobulk-plot}
+p_pb <- ggplot(pseudobulk, aes(x = iavarone_state, y = mean_expression, fill = iavarone_state)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.35, width = 0.55) +
+  geom_point(aes(color = Patient), position = position_jitter(width = 0.12), size = 2.5, alpha = 0.9) +
+  facet_wrap(~ gene, scales = "free_y") +
+  scale_fill_manual(values = state_cols) +
+  labs(
+    title = "PYGL / PYGB by Iavarone state (patient pseudobulk)",
+    subtitle = "One point per patient",
+    x = "Iavarone state",
+    y = "Mean log-normalised expression"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "none", plot.title = element_text(face = "bold"))
+
+print(p_pb)
+ggsave("figures/pseudobulk_abdelfattah.png", p_pb, width = 9, height = 5, dpi = 150)
+```
+
+### Paired patient-level test
+
+```{r step4-paired}
+glioma_per_patient <- obj_tumor@meta.data %>%
+  dplyr::count(Patient, name = "n_glioma")
+
+patient_paired <- expr_long %>%
+  dplyr::group_by(Patient, gene) %>%
+  dplyr::summarise(
+    gpm_mean = mean(expression[iavarone_state == "GPM"], na.rm = TRUE),
+    rest_mean = mean(expression[iavarone_state != "GPM"], na.rm = TRUE),
+    n_gpm = sum(iavarone_state == "GPM"),
+    n_rest = sum(iavarone_state != "GPM"),
+    .groups = "drop"
+  ) %>%
+  dplyr::inner_join(glioma_per_patient, by = "Patient") %>%
+  dplyr::filter(n_gpm > 0, n_rest > 0) %>%
+  dplyr::mutate(paired_diff = gpm_mean - rest_mean)
+
+run_paired_stats <- function(pp_df) {
+  lapply(present_targets, function(g) {
+    sub <- pp_df %>% dplyr::filter(gene == g)
+    if (nrow(sub) < 3) {
+      return(tibble::tibble(
+        gene = g, n_patients = nrow(sub), median_paired_diff = NA_real_,
+        fold_change_gpm_vs_rest = NA_real_, wilcox_p = NA_real_, ttest_p = NA_real_,
+        n_patients_gpm_higher = NA_integer_, verdict = "Insufficient patients"
+      ))
+    }
+    wt <- wilcox.test(sub$gpm_mean, sub$rest_mean, paired = TRUE, exact = FALSE)
+    tt <- t.test(sub$gpm_mean, sub$rest_mean, paired = TRUE)
+    tibble::tibble(
+      gene = g,
+      n_patients = nrow(sub),
+      median_paired_diff = median(sub$paired_diff),
+      fold_change_gpm_vs_rest = mean(sub$gpm_mean) / mean(sub$rest_mean),
+      wilcox_p = wt$p.value,
+      ttest_p = tt$p.value,
+      n_patients_gpm_higher = sum(sub$paired_diff > 0),
+      verdict = if (median(sub$paired_diff) > 0 && wt$p.value < 0.05) {
+        "Enrichment in GPM supported"
+      } else {
+        "Enrichment in GPM not supported"
+      }
+    )
+  }) %>% dplyr::bind_rows()
+}
+
+paired_stats <- run_paired_stats(patient_paired)
+cat("=== All patients with GPM and non-GPM cells ===\n")
+print(paired_stats)
+
+# ndGBM-10 (1 cell), ndGBM-11 (21 cells): exclude patients with <50 Glioma cells
+min_glioma_cells <- 50L
+low_cell_patients <- glioma_per_patient %>%
+  dplyr::filter(n_glioma < min_glioma_cells) %>%
+  dplyr::pull(Patient)
+
+cat("\nPatients with <", min_glioma_cells, " Glioma cells (excluded in sensitivity run):\n", sep = "")
+print(glioma_per_patient %>% dplyr::filter(n_glioma < min_glioma_cells))
+
+patient_paired_filt <- patient_paired %>%
+  dplyr::filter(n_glioma >= min_glioma_cells)
+
+paired_stats_filt <- run_paired_stats(patient_paired_filt)
+paired_stats_filt$analysis <- "Excluding low-cell patients"
+paired_stats$analysis <- "All eligible patients"
+
+sensitivity_tbl <- dplyr::bind_rows(
+  paired_stats %>% dplyr::select(analysis, dplyr::everything()),
+  paired_stats_filt %>% dplyr::select(analysis, dplyr::everything())
+)
+
+cat("\n=== Sensitivity: paired Wilcoxon (full vs >=50 Glioma cells) ===\n")
+print(sensitivity_tbl %>% dplyr::select(analysis, gene, n_patients, n_patients_gpm_higher,
+                                        median_paired_diff, fold_change_gpm_vs_rest, wilcox_p, verdict))
+
+pygl_verdict_unchanged <- identical(
+  paired_stats$verdict[paired_stats$gene == "PYGL"],
+  paired_stats_filt$verdict[paired_stats_filt$gene == "PYGL"]
+)
+cat("\nPYGL verdict unchanged after filtering:", pygl_verdict_unchanged, "\n")
+```
+
+### Spearman vs continuous GPM score
+
+Cell-level Spearman is supplementary. Verdicts follow the paired patient test.
+
+```{r step4-spearman}
+gpm_scores <- obj_tumor@meta.data$GPM
+n_cells <- ncol(obj_tumor)
+
+spearman_stats <- lapply(present_targets, function(g) {
+  gene_expr <- as.numeric(expr_mat[g, ])
+  ct <- cor.test(gpm_scores, gene_expr, method = "spearman", exact = FALSE)
+  paired_row <- paired_stats[paired_stats$gene == g, ]
+  paired_supported <- identical(paired_row$verdict, "Enrichment in GPM supported")
+
+  interp <- if (paired_supported) {
+    if (ct$estimate >= 0.1) {
+      "Cell-level rho is directionally consistent with the paired patient-level result."
+    } else {
+      "Modest cell-level rho; paired patient test is the primary readout."
+    }
+  } else {
+    paste0(
+      "Paired patient-level test is non-significant (primary). ",
+      "Cell-level rho = ", round(unname(ct$estimate), 3),
+      " is weak on its own; with ", format(n_cells, big.mark = ","),
+      " cells, p is not interpretable as independent evidence."
+    )
+  }
+
+  tibble::tibble(
+    gene = g,
+    spearman_rho = unname(ct$estimate),
+    spearman_p = ct$p.value,
+    interpretation = interp
+  )
+}) %>%
+  dplyr::bind_rows()
+
+print(spearman_stats)
+```
+
+---
+
+## Step 5: Replication vs Mikolajewicz
+
+```{r step5-interpret-prep}
+mikol <- tibble::tribble(
+  ~cohort, ~gene, ~wilcox_p, ~fold_change, ~spearman_rho, ~verdict,
+  "Mikolajewicz", "PYGL", 0.037, 1.41, 0.105, "Enrichment in GPM supported",
+  "Mikolajewicz", "PYGB", 0.163, 1.12, 0.051, "Enrichment in GPM not supported"
+)
+
+abdel <- paired_stats %>%
+  dplyr::transmute(
+    cohort = "Abdelfattah",
+    gene,
+    wilcox_p,
+    fold_change = fold_change_gpm_vs_rest,
+    spearman_rho = spearman_stats$spearman_rho[match(gene, spearman_stats$gene)],
+    verdict
+  )
+
+replication_tbl <- dplyr::bind_rows(
+  mikol %>% dplyr::select(cohort, gene, wilcox_p, fold_change, spearman_rho, verdict),
+  abdel %>% dplyr::select(cohort, gene, wilcox_p, fold_change, spearman_rho, verdict)
+)
+
+print(replication_tbl)
+
+fmt_paired <- function(g) {
+  row <- paired_stats[paired_stats$gene == g, ]
+  paste0(
+    "Paired Wilcoxon (", row$n_patients, " patients; ",
+    row$n_patients_gpm_higher, " of ", row$n_patients, " with GPM > rest): ",
+    "median diff = ", round(row$median_paired_diff, 4),
+    ", FC = ", round(row$fold_change_gpm_vs_rest, 2),
+    ", p = ", format.pval(row$wilcox_p, digits = 3),
+    ". Verdict: ", row$verdict, "."
+  )
+}
+
+fmt_spearman <- function(g) {
+  row <- spearman_stats[spearman_stats$gene == g, ]
+  paste0("Cell-level Spearman rho = ", round(row$spearman_rho, 3), ". ", row$interpretation)
+}
+
+fmt_sensitivity <- function(g) {
+  full <- paired_stats[paired_stats$gene == g, ]
+  filt <- paired_stats_filt[paired_stats_filt$gene == g, ]
+  unchanged <- identical(filt$verdict, full$verdict)
+  paste0(
+    "Sensitivity (>=50 Glioma cells): ",
+    filt$n_patients_gpm_higher, " of ", filt$n_patients, " patients GPM > rest, ",
+    "FC = ", round(filt$fold_change_gpm_vs_rest, 2), ", p = ", format.pval(filt$wilcox_p, digits = 3),
+    "; verdict ", filt$verdict,
+    if (unchanged) " (unchanged from full cohort)." else " (differs from full cohort)."
+  )
+}
+
+pygl_paired_line <- fmt_paired("PYGL")
+pygb_paired_line <- fmt_paired("PYGB")
+pygl_spearman_line <- fmt_spearman("PYGL")
+pygb_spearman_line <- fmt_spearman("PYGB")
+pygl_sens_line <- fmt_sensitivity("PYGL")
+pygb_sens_line <- fmt_sensitivity("PYGB")
+
+pygl_replicates <- identical(
+  paired_stats$verdict[paired_stats$gene == "PYGL"],
+  "Enrichment in GPM supported"
+)
+pygb_replicates <- identical(
+  paired_stats$verdict[paired_stats$gene == "PYGB"],
+  "Enrichment in GPM not supported"
+)
+
+pygl_replication_text <- if (pygl_replicates) {
+  paste0(
+    "PYGL enrichment in GPM replicates in this cohort. ",
+    "Wilcoxon p is smaller and fold-change is larger than Mikolajewicz (FC ~1.6 vs ~1.4), ",
+    "but this is one additional cohort (n=17 patients in the paired test), not evidence of a universal effect."
+  )
+} else {
+  "PYGL does not replicate the Mikolajewicz finding here; inspect direction and effect size."
+}
+
+pygb_replication_text <- if (pygb_replicates) {
+  "The null PYGB result replicates: no significant GPM enrichment at the patient level in either cohort."
+} else {
+  "PYGB verdict differs between cohorts; inspect paired stats before concluding."
+}
+```
+
+### PYGL
+
+Mikolajewicz: p = 0.037, FC = 1.41, Spearman rho = 0.105, supported.
+
+`r pygl_paired_line`
+
+`r pygl_sens_line`
+
+`r pygl_spearman_line`
+
+Replication: `r pygl_replication_text`
+
+### PYGB
+
+Mikolajewicz: p = 0.16, FC = 1.12, Spearman rho = 0.051, not supported.
+
+`r pygb_paired_line`
+
+`r pygb_sens_line`
+
+`r pygb_spearman_line`
+
+Replication: `r pygb_replication_text`
+
+### Limitations
+
+We had 17 patients in the paired test (one lacked GPM or non-GPM cells). Two patients contributed very few Glioma cells (ndGBM-10: 1, ndGBM-11: 21); the sensitivity analysis excluding patients with fewer than 50 Glioma cells is reported above. Primary and recurrent tumours are mixed in `Type`. CopyKat called ~29% of Glioma cells diploid; we used author `Assignment` labels only. Non-GPM cells are NEU-heavy, so the pooled rest mean is not MTC-specific. PPR signatures may miss H2AZ1/H4C3 as in Mikolajewicz. States are assigned winner-take-all from continuous scores. Pseudobulk avoids single-cell dropout in the headline figure.
+
+### Summary
+
+PYGL is higher in GPM at the patient level in both cohorts; PYGB does not show clear GPM enrichment in either. Treat them as separate targets.
+
+---
+
+## Session info
+
+```{r session-info}
+sessionInfo()
+```
